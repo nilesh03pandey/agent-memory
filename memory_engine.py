@@ -241,6 +241,7 @@ class MemoryEngine:
             if self._embedder is None:
                 self._embedder = SentenceTransformer(self._embed_model_name)
                 #if torch.cuda.is_available(): self._embedder = self._embedder.cuda() #moves to GPU if available and desired
+                #purely works with CPU as well, just slower for large memory sets
                 self._embedder = SentenceTransformer(self._embed_model_name)
             return self._embedder
         
