@@ -16,6 +16,9 @@ from typing import Optional
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from enum import Enum
+from sentence_transformers import SentenceTransformer
+from sentence_transformers.util import cos_sim
+import torch
 
 
 # ─────────────────────────────────────────
@@ -220,6 +223,7 @@ class MemoryEngine:
         agent_id: str,
         storage: Optional[LocalStorage] = None,
         classifier: Optional[ImportanceClassifier] = None,
+        embed_model_name: str = "all-MiniLM-L6-v2",
     ):
         self.agent_id   = agent_id
         self.storage    = storage or LocalStorage()
@@ -227,6 +231,47 @@ class MemoryEngine:
         self._memories: list[Memory] = []
         self._meta: dict = {}
         self._load()
+        self._embed_model_name = embed_model_name
+        self._embedder: SentenceTransformer | None = None
+        self._embeddings: torch.Tensor | None = None        # shape: (n_mem, dim)
+        self._embed_index_to_mem_index: list[int] | None = None # it # maps embedding row --> self._memories index
+        
+        @property
+        def embedder(self) -> SentenceTransformer:
+            if self._embedder is None:
+                self._embedder = SentenceTransformer(self._embed_model_name)
+                #if torch.cuda.is_available(): self._embedder = self._embedder.cuda() #moves to GPU if available and desired
+                #purely works with CPU as well, just slower for large memory sets
+                self._embedder = SentenceTransformer(self._embed_model_name)
+            return self._embedder
+        
+        def _rebuild_embedding_cache(self) -> None:
+            if not self._memories:
+                self._embeddings = None
+                self._embed_index_to_mem_index = None
+                return
+
+            contents = [m.content.strip() for m in self._memories if m.content.strip()]
+            if not contents:
+                self._embeddings = None
+                return
+
+            emb_list = self.embedder.encode(
+                contents,
+                batch_size=32,
+                show_progress_bar=False,
+                convert_to_tensor=True,
+                device=self.embedder.device
+            )
+
+            self._embeddings = emb_list
+            # Keep mapping because we might have empty contents skipped (rare)
+            self._embed_index_to_mem_index = list(range(len(self._memories)))
+
+            def _ensure_embeddings(self):
+                if self._embeddings is None or len(self._embeddings) != len(self._memories):
+                    self._rebuild_embedding_cache()
+
 
     # ── Persistence ──────────────────────────────────────
 
@@ -317,7 +362,7 @@ class MemoryEngine:
 
         self._save()
         return results[:limit]
-
+        
     def retrieve_context(self, limit_per_layer: int = 3) -> dict[str, list[Memory]]:
         """
         Retrieve a balanced context snapshot across all memory layers.
@@ -330,15 +375,54 @@ class MemoryEngine:
             "episodic":   self.retrieve(MemoryType.EPISODIC,   limit=limit_per_layer),
             "semantic":   self.retrieve(MemoryType.SEMANTIC,   limit=limit_per_layer),
         }
+        
+        #work here
+    def search(self, query: str, top_k: int = 5, min_score_threshold: float = 0.3) -> list[Memory]:
+            """
+            Semantic search across all memories using sentence-transformers embeddings.
+            Falls back to substring search if embedding model is disabled/not loaded.
+            Update: Similarity search added with a minimum score threshold and fallback to substring search if embedding fails.
+            """
+            if not query.strip() or not self._memories:
+                return []
 
-    def search(self, query: str, top_k: int = 5) -> list[Memory]:
-        """
-        Search across all memory types for relevant content.
-        Simple substring for now. Swap for embedding search when needed.
-        """
-        q = query.lower()
-        results = [m for m in self._memories if q in m.content.lower()]
-        return sorted(results, key=lambda m: m.score(), reverse=True)[:top_k]
+            query = query.strip()
+            q_lower = query.lower()
+
+            use_semantic = self._embed_model_name is not None
+
+            if use_semantic:
+                try:
+                    self._ensure_embeddings()
+
+                    if self._embeddings is not None and self._embeddings.shape[0] > 0:
+                        q_emb = self.embedder.encode(query, convert_to_tensor=True)
+                        sims = cos_sim(q_emb.unsqueeze(0), self._embeddings)[0]   # shape (n_mem,)
+
+                        # Get top candidates
+                        values, indices = torch.topk(sims, k=min(top_k * 3, len(sims)), sorted=True)
+
+                        result_memories = []
+                        for val, idx in zip(values.tolist(), indices.tolist()):
+                            if val.item() < min_score_threshold:
+                                break
+                            mem_idx = self._embed_index_to_mem_index[idx]
+                            mem = self._memories[mem_idx]
+                            mem._semantic_score = val.item()   # optional: expose for debugging
+                            result_memories.append(mem)
+
+                        # Still sort by your original composite score as secondary key
+                        result_memories.sort(key=lambda m: (getattr(m, '_semantic_score', 0), m.score()), reverse=True)
+                        return result_memories[:top_k]
+
+                except Exception as e:
+                    print(f"Semantic search failed: {e} → falling back to substring")
+                    # continue to fallback
+
+            # Fallback: original substring + score sort
+            results = [m for m in self._memories if q_lower in m.content.lower()]
+            results = sorted(results, key=lambda m: m.score(), reverse=True)[:top_k]
+            return results
 
     def forget(self, memory_id: str) -> bool:
         """Explicitly forget a specific memory by ID."""
@@ -499,3 +583,4 @@ class MemoryEngine:
             f"memories={s['total_memories']}, "
             f"pressure={s['memory_pressure']:.1%})"
         )
+
